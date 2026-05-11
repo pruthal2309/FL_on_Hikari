@@ -31,7 +31,7 @@ np.random.seed(42)
 random.seed(42)
 
 # ── Config ───────────────────────────────────────────────────────────────────
-DATA_PATH    = "/mnt/user-data/uploads/ALLFLOWMETER_HIKARI2021.csv"
+DATA_PATH    = "/kaggle/input/datasets/kk0105/allflowmeter-hikari2021/ALLFLOWMETER_HIKARI2021.csv"
 OUTPUT_DIR   = "/mnt/user-data/outputs"
 DIRICHLET_ALPHA = 0.5          # lower → more label skew; try 0.1 for extreme
 N_TREES_PER_CLIENT = 50        # trees per local RF model

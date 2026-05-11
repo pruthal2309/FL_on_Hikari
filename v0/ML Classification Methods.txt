@@ -1,0 +1,49 @@
+Different ML methods for classification
+
+1️⃣ Classical (Traditional) Machine Learning
+
+These work directly on tabular data, usually require feature engineering, and are fast to train.
+
+Popular Algorithms:
+
+Decision Trees → Simple tree-like models.
+Random Forest → Ensemble of decision trees.
+Gradient Boosting → XGBoost, LightGBM, CatBoost (boosting multiple trees sequentially).
+Support Vector Machines (SVM) → Finds a hyperplane to separate classes.
+k-Nearest Neighbors (kNN) → Classifies based on closest training examples.
+Logistic Regression → For linear separable classes (binary or multi-class).
+Naive Bayes → Probabilistic classifier, assumes feature independence.
+
+✅ Pros: Fast, interpretable, works well on tabular data.
+❌ Cons: Often need feature engineering, may not capture complex patterns.
+
+2️⃣ Neural Networks / Deep Learning
+
+These are more powerful, especially for unstructured data (images, text, sequences).
+
+Popular Types:
+
+Fully Connected / Dense Networks → Simple feedforward network.
+Convolutional Neural Networks (CNN) → Great for images or sequential tabular data patterns.
+Recurrent Neural Networks (RNN) → Good for sequences like time series, traffic flow, or text.
+LSTM / GRU → Advanced RNNs that handle long-term dependencies.
+Transformers → State-of-the-art for text, sequences, and attention-based tasks.
+
+✅ Pros: Can model complex patterns automatically.
+❌ Cons: Requires more data, computationally heavier, harder to interpret.
+
+3️⃣ Ensemble & Hybrid Methods
+
+These combine multiple models to improve performance.
+
+Bagging → Example: Random Forest (multiple trees in parallel).
+Boosting → Example: XGBoost, LightGBM, CatBoost (trees sequentially, focus on mistakes).
+Stacking → Combines predictions of multiple model types (e.g., CNN + Random Forest).
+
+✅ Pros: Usually better accuracy, more robust.
+❌ Cons: Slower, less interpretable.
+
+Summary Table
+1) Traditional ML	Decision Tree, Random Forest, SVM, kNN, Logistic Regression	Tabular data, fast, interpretable
+2) Neural Networks	CNN, RNN, LSTM, Transformers	                                Unstructured/sequential data, complex patterns
+3) Ensemble / Hybrid	Bagging, Boosting, Stacking	                                Combines multiple models, high accuracy

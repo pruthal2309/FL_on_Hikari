@@ -1,178 +1,278 @@
 """
 =============================================================================
-  Federated Learning on ALLFLOWMETER_HIKARI_2021  — v3 (FINAL)
-  ---------------------------------------------------------------
-  FINAL FIX: Size-Aware Two-Phase Dirichlet Partition
+  FEDERATED LEARNING — NEURAL NETWORK + TRUE FedAvg WEIGHT AGGREGATION
+  Dataset : ALLFLOWMETER_HIKARI_2021
+  Author  : FL Engineer
+  Version : v4 — Neural Network Edition
+=============================================================================
 
-  Problem with v2: Even with 70% dominance reserved, minority clients
-  (XMRIGCC=2.6K, Bruteforce-XML=4.1K) get flooded by residuals from
-  majority classes (Benign=347K). 30% of Benign = 83K, split over 6
-  clients = ~14K each, which dwarfs the 1.8K dominant XMRIGCC slice.
+  ARCHITECTURE OVERVIEW
+  ─────────────────────
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │                    FEDERATED LEARNING SYSTEM                        │
+  │                                                                     │
+  │   Client 0          Client 1    ...    Client 5                    │
+  │  [LocalNN]          [LocalNN]          [LocalNN]                   │
+  │   Trains on         Trains on          Trains on                   │
+  │   local data        local data         local data                  │
+  │       │                 │                  │                        │
+  │       └────────── ▼ Send Weights ──────────┘                       │
+  │                  [GLOBAL SERVER]                                    │
+  │              FedAvg: W_global = Σ (n_k/N) × W_k                   │
+  │                  ↓ Broadcast ↓                                      │
+  │       ┌─────────────────────────────────┐                          │
+  │  Next Round: clients load global weights → fine-tune locally       │
+  │       └─────────────────────────────────┘                          │
+  └─────────────────────────────────────────────────────────────────────┘
 
-  ROOT CAUSE: Class imbalance ratio = 106x. No fixed fraction fixes this
-  without also capping residual injection.
-
-  FINAL SOLUTION — Size-Aware Capped Residual Partition:
-  Phase 1: Client k gets dominant_frac (70%) of class k exclusively.
-  Phase 2: Residuals from other classes are capped per-client so that
-           no residual class can exceed `residual_cap_frac` (30%) of
-           the client's OWN dominant slice size. This prevents large
-           classes from flooding minority clients.
+  KEY DESIGN DECISIONS
+  ────────────────────
+  1. Local Model   : Deep MLP with BatchNorm + Dropout + GELU activations
+                     Input(81) → 512 → 256 → 128 → 64 → Output(6)
+  2. Loss Function : Focal Loss (handles 106x class imbalance far better
+                     than CrossEntropy — penalises easy examples less)
+  3. Optimizer     : AdamW with CosineAnnealingLR per client
+  4. FedAvg        : TRUE weight averaging — Σ(n_k/N)×θ_k per layer tensor
+                     (not soft-voting — actual model parameter aggregation)
+  5. FL Rounds     : Multiple communication rounds; each round clients
+                     start from global weights → local fine-tune → aggregate
+  6. Partition     : Size-Aware Capped Dirichlet (v3 fix retained)
+  7. Evaluation    : Per-round global accuracy tracked + full final report
 =============================================================================
 """
 
-import os, warnings, random
+# ── Imports ──────────────────────────────────────────────────────────────────
+import os, warnings, random, copy
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from collections import Counter
+import matplotlib.patches as mpatches
+
+from collections import Counter, defaultdict
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (accuracy_score, classification_report,
                              confusion_matrix, ConfusionMatrixDisplay)
 from sklearn.model_selection import train_test_split
-from sklearn.utils.class_weight import compute_class_weight
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 warnings.filterwarnings("ignore")
-np.random.seed(42)
-random.seed(42)
+SEED = 42
+random.seed(SEED); np.random.seed(SEED)
+torch.manual_seed(SEED)
 
-# ── Config ───────────────────────────────────────────────────────────────────
-DATA_PATH        = "/mnt/user-data/uploads/ALLFLOWMETER_HIKARI2021.csv"
-OUTPUT_DIR       = "/mnt/user-data/outputs"
-DOMINANT_FRAC    = 0.75   # fraction of each class given exclusively to owner client
-RESIDUAL_CAP     = 0.30   # max residual per-foreign-class as fraction of dominant slice
-DIRICHLET_ALPHA  = 0.5    # heterogeneity of residual spread
-N_TREES          = 60
-TEST_SPLIT       = 0.20
-TARGET_COL       = "traffic_category"
-DROP_COLS        = ["Unnamed: 0.1", "Unnamed: 0", "uid", "originh", "responh", "Label"]
+# ── Hyperparameters & Config ─────────────────────────────────────────────────
+DATA_PATH       = "/kaggle/input/datasets/kk0105/allflowmeter-hikari2021/ALLFLOWMETER_HIKARI2021.csv"
+OUTPUT_DIR      = "/mnt/user-data/outputs"
+TARGET_COL      = "traffic_category"
+DROP_COLS       = ["Unnamed: 0.1", "Unnamed: 0", "uid", "originh", "responh", "Label"]
 
+# Partition
+DOMINANT_FRAC   = 0.75
+RESIDUAL_CAP    = 0.30
+DIRICHLET_ALPHA = 0.5
+
+# FL Training
+FL_ROUNDS       = 5       # number of global communication rounds
+LOCAL_EPOCHS    = 5       # local epochs per round per client
+BATCH_SIZE      = 512
+LR              = 1e-3
+WEIGHT_DECAY    = 1e-4
+TEST_SPLIT      = 0.20
+
+# NN Architecture
+HIDDEN_DIMS     = [512, 256, 128, 64]
+DROPOUT_RATE    = 0.3
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# STEP 1 — DATA PREPROCESSING
-# ═══════════════════════════════════════════════════════════════════════════
-print("\n" + "="*70)
+# ════════════════════════════════════════════════════════════════════════════
+# MODULE 1 — NEURAL NETWORK ARCHITECTURE
+# ════════════════════════════════════════════════════════════════════════════
+
+class TrafficClassifierNN(nn.Module):
+    """
+    Deep MLP for network traffic classification.
+
+    Architecture:
+        Input(81) → [Linear→BN→GELU→Dropout] × 4 layers → Output(6)
+
+    Design choices:
+    • BatchNorm   : stabilises training on heterogeneous FL client data
+    • GELU        : smoother gradient flow vs ReLU for tabular data
+    • Dropout     : regularisation — critical since clients have skewed data
+    • Residual    : skip connection between layer pairs to ease optimisation
+    """
+
+    def __init__(self, input_dim: int, hidden_dims: list, n_classes: int,
+                 dropout: float = 0.3):
+        super().__init__()
+        self.input_dim   = input_dim
+        self.n_classes   = n_classes
+
+        layers = []
+        in_dim = input_dim
+        for i, h_dim in enumerate(hidden_dims):
+            layers += [
+                nn.Linear(in_dim, h_dim),
+                nn.BatchNorm1d(h_dim),
+                nn.GELU(),
+                nn.Dropout(dropout if i < len(hidden_dims)-1 else dropout*0.5)
+            ]
+            in_dim = h_dim
+
+        self.backbone   = nn.Sequential(*layers)
+        self.classifier = nn.Linear(in_dim, n_classes)
+
+        # Residual projection for skip connection (input → last hidden)
+        self.residual_proj = nn.Linear(input_dim, hidden_dims[-1])
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.residual_proj(x)          # skip connection
+        out      = self.backbone(x)
+        out      = out + residual                  # add residual
+        return self.classifier(out)               # raw logits
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# MODULE 2 — FOCAL LOSS
+# ════════════════════════════════════════════════════════════════════════════
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for multi-class imbalanced classification.
+    FL(p_t) = -α_t × (1 - p_t)^γ × log(p_t)
+
+    γ (gamma) : focusing parameter. γ=0 → standard CE. γ=2 (default) puts
+                more weight on hard misclassified examples, ignoring easy ones.
+    α (alpha) : per-class weight tensor to handle class frequency imbalance.
+
+    This is CRITICAL here: imbalance ratio = 106x. Standard CrossEntropy
+    would collapse to predicting only Benign (62.6% of data).
+    """
+
+    def __init__(self, alpha: torch.Tensor = None, gamma: float = 2.0):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha  # shape: (n_classes,)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce_loss  = F.cross_entropy(logits, targets, reduction="none",
+                                   weight=self.alpha)
+        pt       = torch.exp(-ce_loss)             # probability of correct class
+        focal_w  = (1.0 - pt) ** self.gamma
+        loss     = (focal_w * ce_loss).mean()
+        return loss
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# MODULE 3 — DATA PREPROCESSING
+# ════════════════════════════════════════════════════════════════════════════
+
+print("\n" + "="*72)
 print("  STEP 1 │ DATA PREPROCESSING")
-print("="*70)
+print("="*72)
 
 df = pd.read_csv(DATA_PATH)
 print(f"  Raw shape : {df.shape}")
 df.drop(columns=[c for c in DROP_COLS if c in df.columns], inplace=True)
 
-le = LabelEncoder()
+le        = LabelEncoder()
 df["label_enc"] = le.fit_transform(df[TARGET_COL])
 classes   = le.classes_
 n_classes = len(classes)
 n_clients = n_classes
 
-print(f"\n  Classes ({n_classes}):")
+print(f"\n  Target classes ({n_classes}):")
 vc = df[TARGET_COL].value_counts()
 for cls, cnt in vc.items():
-    print(f"    {cls:<25} {cnt:>7,}  ({100*cnt/len(df):.1f}%)")
-print(f"\n  Imbalance ratio (max/min): "
-      f"{vc.max()/vc.min():.0f}x  ← this is why a simple fix fails")
+    bar = "█" * int(30 * cnt / vc.max())
+    print(f"    {cls:<25} {cnt:>7,}  {bar}")
+print(f"\n  Imbalance ratio : {vc.max()//vc.min()}x  → Focal Loss will handle this")
 
+# Encode remaining object columns
 for c in df.select_dtypes(include="object").columns:
     if c != TARGET_COL:
         df[c] = LabelEncoder().fit_transform(df[c].astype(str))
 
 feature_cols = [c for c in df.columns if c not in [TARGET_COL, "label_enc"]]
+input_dim    = len(feature_cols)
 X = np.nan_to_num(df[feature_cols].values.astype(np.float32))
-y = df["label_enc"].values.astype(int)
+y = df["label_enc"].values.astype(np.int64)
 
 X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=TEST_SPLIT, random_state=42, stratify=y)
+    X, y, test_size=TEST_SPLIT, random_state=SEED, stratify=y)
 
 scaler  = StandardScaler()
-X_train = scaler.fit_transform(X_train)
-X_test  = scaler.transform(X_test)
+X_train = scaler.fit_transform(X_train).astype(np.float32)
+X_test  = scaler.transform(X_test).astype(np.float32)
 
-print(f"\n  Train: {len(X_train):,}  |  Test: {len(X_test):,}")
+# Global test tensors
+X_test_t = torch.from_numpy(X_test).to(DEVICE)
+y_test_t  = torch.from_numpy(y_test).to(DEVICE)
+
+print(f"\n  Input features : {input_dim}")
+print(f"  Train samples  : {len(X_train):,}")
+print(f"  Test  samples  : {len(X_test):,}")
+print(f"  Device         : {DEVICE}")
 print("  Preprocessing complete ✓")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# STEP 2 — SIZE-AWARE CAPPED DIRICHLET PARTITION
-# ═══════════════════════════════════════════════════════════════════════════
-print("\n" + "="*70)
-print("  STEP 2 │ SIZE-AWARE CAPPED DIRICHLET PARTITION (v3 — FINAL FIX)")
-print("="*70)
-print(f"""
-  Strategy: Three-Phase Size-Aware Partition
-  ──────────────────────────────────────────
-  Phase 1 — Dominant slice ({int(DOMINANT_FRAC*100)}%):
-            Client k exclusively gets {int(DOMINANT_FRAC*100)}% of class k's samples.
-            This is the ONLY source of class k for client k.
+# ════════════════════════════════════════════════════════════════════════════
+# MODULE 4 — DIRICHLET PARTITION (Size-Aware Capped — v3 logic retained)
+# ════════════════════════════════════════════════════════════════════════════
 
-  Phase 2 — Capped residual injection:
-            From each foreign class j≠k, client k gets at most
-            {int(RESIDUAL_CAP*100)}% × |dominant_slice_k| samples.
-            This CAPS large-class contamination proportional to the
-            client's own dominant size — solving the 106x imbalance issue.
-
-  Phase 3 — Dirichlet-ordered selection within cap:
-            Within the cap, samples are selected via Dirichlet-weighted
-            sampling to maintain stochastic heterogeneity.
-
-  Expected result: Every client dominated ≥70% by its assigned class.
-""")
+print("\n" + "="*72)
+print("  STEP 2 │ SIZE-AWARE CAPPED DIRICHLET PARTITION")
+print("="*72)
 
 
 def size_aware_partition(y, n_clients, dominant_frac=0.75,
                          residual_cap=0.30, alpha=0.5, seed=42):
-    """
-    Size-Aware Capped Dirichlet Partition.
-
-    For each client k:
-      1. Take dominant_frac of class k → assigned exclusively to client k.
-      2. For every other class j, compute:
-            cap_k_j = int(residual_cap * dominant_size_k)
-         Then from class j's residual pool, give client k at most cap_k_j
-         samples (Dirichlet-weighted ordering across clients).
-
-    This guarantees dominance even when imbalance ratio > 100x.
-    """
-    rng = np.random.default_rng(seed)
-
-    # ── Phase 1: build dominant slices ──────────────────────────────────
-    dominant_pool = {}   # cls -> dominant indices for its owner
-    residual_pool = {}   # cls -> residual indices for Dirichlet distribution
+    rng            = np.random.default_rng(seed)
+    dominant_pool  = {}
+    residual_pool  = {}
 
     for cls_id in range(n_clients):
-        idx = np.where(y == cls_id)[0].copy()
+        idx   = np.where(y == cls_id)[0].copy()
         rng.shuffle(idx)
         n_dom = int(len(idx) * dominant_frac)
         dominant_pool[cls_id] = idx[:n_dom]
         residual_pool[cls_id] = idx[n_dom:]
 
     dominant_sizes = {k: len(v) for k, v in dominant_pool.items()}
-
-    # ── Phase 2 & 3: capped residual injection ───────────────────────────
     client_indices = [list(dominant_pool[k]) for k in range(n_clients)]
 
     for cls_id in range(n_clients):
         res = residual_pool[cls_id].copy()
         if len(res) == 0:
             continue
-        # Dirichlet proportions → ordering priority per client
         props = rng.dirichlet(alpha * np.ones(n_clients))
-        # Sort clients by their proportion (highest gets first pick)
         order = np.argsort(-props)
         ptr   = 0
         for k in order:
             if ptr >= len(res):
                 break
-            # Cap for this client k receiving from class cls_id
-            cap = int(residual_cap * dominant_sizes[k])
+            cap  = int(residual_cap * dominant_sizes[k])
             give = min(cap, len(res) - ptr)
             if give > 0:
                 client_indices[k].extend(res[ptr:ptr+give].tolist())
                 ptr += give
 
-    # Shuffle each client's full dataset
     for k in range(n_clients):
         arr = np.array(client_indices[k])
         rng.shuffle(arr)
@@ -182,180 +282,452 @@ def size_aware_partition(y, n_clients, dominant_frac=0.75,
 
 
 client_indices = size_aware_partition(
-    y_train, n_clients,
-    dominant_frac=DOMINANT_FRAC,
-    residual_cap=RESIDUAL_CAP,
-    alpha=DIRICHLET_ALPHA)
+    y_train, n_clients, DOMINANT_FRAC, RESIDUAL_CAP, DIRICHLET_ALPHA)
 
-client_names = [f"Client_{k}_{classes[k]}" for k in range(n_clients)]
+client_names   = [f"Client_{k}_{classes[k]}" for k in range(n_clients)]
 
-# ── Partition report ──────────────────────────────────────────────────────
-print(f"  {'Client':<35} {'Total':>8}  {'Dom%':>6}  Top-3 class distribution")
-print(f"  {'-'*90}")
-
+print(f"\n  {'Client':<38} {'N':>8}  {'Dom%':>6}  Top-2 distribution")
+print(f"  {'-'*80}")
 partition_stats = []
-all_dom_pcts = []
 for k, (name, idx) in enumerate(zip(client_names, client_indices)):
     local_y   = y_train[idx]
     cls_count = Counter(local_y)
     total     = len(local_y)
-    dom_pct   = 100 * cls_count.get(k, 0) / total if total > 0 else 0
-    all_dom_pcts.append(dom_pct)
-    top3 = ", ".join(
-        f"{classes[c]}:{cls_count[c]}({100*cls_count[c]/total:.1f}%)"
-        for c, _ in cls_count.most_common(3))
-    status = "✅" if dom_pct >= 50 else "⚠️ "
-    print(f"  {status} {name:<33} {total:>8,}  {dom_pct:>5.1f}%  {top3}")
+    dom_pct   = 100 * cls_count.get(k, 0) / total
+    top2      = " | ".join(
+        f"{classes[c]}:{100*cls_count[c]/total:.1f}%"
+        for c, _ in cls_count.most_common(2))
+    flag = "✅" if dom_pct >= 50 else "⚠️ "
+    print(f"  {flag} {name:<36} {total:>8,}  {dom_pct:>5.1f}%  {top2}")
     partition_stats.append({
-        "client": f"C{k}\n{classes[k][:8]}", "n_samples": total,
+        "client": f"C{k}\n{classes[k][:7]}", "n_samples": total,
         **{classes[c]: cls_count.get(c, 0) for c in range(n_classes)}
     })
 
-print(f"\n  Mean dominance %: {np.mean(all_dom_pcts):.1f}%  "
-      f"| Min: {np.min(all_dom_pcts):.1f}%  | Max: {np.max(all_dom_pcts):.1f}%")
-
-# ── Plots ─────────────────────────────────────────────────────────────────
+# Partition visualisation
 colors = plt.cm.tab10(np.linspace(0, 1, n_classes))
 ps_df  = pd.DataFrame(partition_stats).set_index("client")
 
-fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-fig.suptitle(
-    f"v3 Size-Aware Capped Dirichlet Partition\n"
-    f"(dominant_frac={DOMINANT_FRAC}, residual_cap={RESIDUAL_CAP}, α={DIRICHLET_ALPHA})",
-    fontsize=12, fontweight="bold")
-
+fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+fig.suptitle(f"Dirichlet Partition  (dom_frac={DOMINANT_FRAC}, "
+             f"res_cap={RESIDUAL_CAP}, α={DIRICHLET_ALPHA})",
+             fontsize=12, fontweight="bold")
 (ps_df[list(classes)].div(ps_df["n_samples"], axis=0) * 100).plot(
     kind="bar", stacked=True, ax=axes[0], color=colors, edgecolor="white")
-axes[0].set_title("Class Composition per Client (%) — Each client dominated by its class")
+axes[0].set_title("Class Composition per Client (%)")
 axes[0].set_ylabel("Percentage")
-axes[0].tick_params(axis="x", labelrotation=0, labelsize=7)
-axes[0].legend(classes, loc="upper right", fontsize=7)
+axes[0].tick_params(axis="x", labelrotation=0, labelsize=8)
+axes[0].legend(classes, fontsize=7, loc="upper right")
 
-# Highlight dominant % on bars
-dom_vals = [100 * Counter(y_train[client_indices[k]]).get(k, 0) / len(client_indices[k])
+dom_vals = [100*Counter(y_train[client_indices[k]]).get(k,0)/len(client_indices[k])
             for k in range(n_clients)]
-bars = ps_df["n_samples"].plot(kind="bar", ax=axes[1], color="steelblue", edgecolor="white")
-for i, (bar, dp) in enumerate(zip(axes[1].patches, dom_vals)):
-    axes[1].text(bar.get_x()+bar.get_width()/2, bar.get_height()+200,
-                 f"Dom:\n{dp:.0f}%", ha="center", va="bottom", fontsize=8, color="darkblue")
-axes[1].set_title("Sample Count per Client (with dominance %)")
+ax1_bars = axes[1].bar(
+    [f"C{k}" for k in range(n_clients)],
+    [len(client_indices[k]) for k in range(n_clients)],
+    color=colors, edgecolor="white")
+for bar, dp in zip(ax1_bars, dom_vals):
+    axes[1].text(bar.get_x()+bar.get_width()/2, bar.get_height()+300,
+                 f"dom\n{dp:.0f}%", ha="center", va="bottom", fontsize=8)
+axes[1].set_title("Samples per Client")
 axes[1].set_ylabel("# Samples")
-axes[1].tick_params(axis="x", labelrotation=0, labelsize=7)
 
 plt.tight_layout()
-plt.savefig(os.path.join(OUTPUT_DIR, "partition_plot_v3.png"), dpi=150)
+plt.savefig(f"{OUTPUT_DIR}/fl_nn_partition.png", dpi=150)
 plt.close()
-print("  Partition plot saved ✓")
+print("\n  Partition plot saved ✓")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# STEP 3 — LOCAL TRAINING
-# ═══════════════════════════════════════════════════════════════════════════
-print("\n" + "="*70)
-print("  STEP 3 │ LOCAL CLIENT TRAINING")
-print("="*70)
 
-local_models, local_accs = [], []
-for k, (name, idx) in enumerate(zip(client_names, client_indices)):
-    X_loc = X_train[idx]
-    y_loc = y_train[idx]
-    if len(np.unique(y_loc)) < 2:
-        print(f"  [{k}] {name}: only 1 class — skipping")
-        local_models.append(None); local_accs.append(None); continue
+# ════════════════════════════════════════════════════════════════════════════
+# MODULE 5 — FEDERATED UTILITIES
+# ════════════════════════════════════════════════════════════════════════════
 
-    X_tr, X_val, y_tr, y_val = train_test_split(
-        X_loc, y_loc, test_size=0.15, random_state=42, stratify=y_loc)
-    cw_dict = dict(zip(
-        np.unique(y_tr),
-        compute_class_weight("balanced", classes=np.unique(y_tr), y=y_tr)))
+def get_model() -> TrafficClassifierNN:
+    """Instantiate a fresh global-architecture model."""
+    return TrafficClassifierNN(
+        input_dim=input_dim,
+        hidden_dims=HIDDEN_DIMS,
+        n_classes=n_classes,
+        dropout=DROPOUT_RATE
+    ).to(DEVICE)
 
-    rf = RandomForestClassifier(n_estimators=N_TREES, max_depth=15,
-                                min_samples_leaf=5, class_weight=cw_dict,
-                                n_jobs=-1, random_state=42)
-    rf.fit(X_tr, y_tr)
-    acc = accuracy_score(y_val, rf.predict(X_val))
-    local_accs.append(acc); local_models.append(rf)
 
-    dom_pct = 100 * Counter(y_loc)[k] / len(y_loc)
-    print(f"  [{k}] {name:<40} n={len(X_tr):>7,}  dom={dom_pct:.1f}%  acc={acc:.4f}")
+def get_model_weights(model: nn.Module) -> dict:
+    """Extract a deep copy of model state_dict (weights only, no grad)."""
+    return copy.deepcopy(model.state_dict())
 
-# ═══════════════════════════════════════════════════════════════════════════
-# STEP 4 — FEDAVG AGGREGATION
-# ═══════════════════════════════════════════════════════════════════════════
-print("\n" + "="*70)
-print("  STEP 4 │ FEDAVG AGGREGATION (Weighted Soft Voting)")
-print("="*70)
 
-valid   = [(k, m) for k, m in enumerate(local_models) if m is not None]
-sizes   = np.array([len(client_indices[k]) for k, _ in valid], dtype=float)
-weights = sizes / sizes.sum()
+def set_model_weights(model: nn.Module, weights: dict) -> nn.Module:
+    """Load a state_dict into a model."""
+    model.load_state_dict(weights)
+    return model
 
-proba_agg = np.zeros((len(X_test), n_classes))
-for i, (k, model) in enumerate(valid):
-    lp = np.zeros((len(X_test), n_classes))
-    rp = model.predict_proba(X_test)
-    for j, ci in enumerate(model.classes_):
-        lp[:, ci] = rp[:, j]
-    proba_agg += weights[i] * lp
-    print(f"  Client {k} ({classes[k]:<22}) weight={weights[i]:.4f}")
 
-y_pred = np.argmax(proba_agg, axis=1)
+def fedavg_aggregate(client_weights: list, client_sizes: list) -> dict:
+    """
+    True FedAvg Aggregation.
+    Computes: W_global = Σ_k (n_k / N) × W_k
+    for every parameter tensor in the model.
 
-# ═══════════════════════════════════════════════════════════════════════════
-# STEP 5 — EVALUATION
-# ═══════════════════════════════════════════════════════════════════════════
-print("\n" + "="*70)
-print("  STEP 5 │ GLOBAL MODEL EVALUATION")
-print("="*70)
+    Parameters
+    ----------
+    client_weights : list of state_dicts from each participating client
+    client_sizes   : list of local dataset sizes (n_k)
 
-global_acc = accuracy_score(y_test, y_pred)
-print(f"\n  ✅ Global Federated Accuracy : {global_acc*100:.2f}%\n")
+    Returns
+    -------
+    aggregated state_dict (global model weights)
+    """
+    total_samples = sum(client_sizes)
+    fed_weights   = [n / total_samples for n in client_sizes]
+
+    # Start with a zero-valued copy of the first client's state_dict
+    agg_weights = {}
+    for key in client_weights[0].keys():
+        # Weighted sum across all clients for this parameter tensor
+        agg_weights[key] = sum(
+            fed_weights[i] * client_weights[i][key].float()
+            for i in range(len(client_weights))
+        )
+
+    return agg_weights
+
+
+def make_focal_loss(y_local: np.ndarray) -> FocalLoss:
+    """
+    Build FocalLoss with per-class alpha weights derived from
+    inverse class frequency on the local client data.
+    """
+    counts    = np.bincount(y_local, minlength=n_classes).astype(float)
+    counts    = np.where(counts == 0, 1e-6, counts)   # avoid div/0
+    freq      = counts / counts.sum()
+    alpha     = torch.tensor(1.0 / freq, dtype=torch.float32).to(DEVICE)
+    alpha     = alpha / alpha.sum()                    # normalise
+    return FocalLoss(alpha=alpha, gamma=2.0)
+
+
+def make_dataloader(X_local: np.ndarray, y_local: np.ndarray,
+                    batch_size: int) -> DataLoader:
+    """
+    Build a DataLoader with WeightedRandomSampler to further counter
+    within-client class imbalance during mini-batch sampling.
+    """
+    dataset   = TensorDataset(
+        torch.from_numpy(X_local).float(),
+        torch.from_numpy(y_local).long()
+    )
+    counts    = np.bincount(y_local, minlength=n_classes).astype(float)
+    counts    = np.where(counts == 0, 1.0, counts)
+    class_wt  = 1.0 / counts
+    sample_wt = torch.tensor([class_wt[y] for y in y_local], dtype=torch.float)
+    sampler   = WeightedRandomSampler(sample_wt, num_samples=len(sample_wt),
+                                      replacement=True)
+    return DataLoader(dataset, batch_size=batch_size, sampler=sampler,
+                      drop_last=False)
+
+
+def local_train(model: nn.Module, X_local: np.ndarray, y_local: np.ndarray,
+                epochs: int, lr: float, wd: float) -> tuple:
+    """
+    Train model locally for `epochs` epochs.
+    Returns (trained model, list of epoch losses).
+    """
+    model.train()
+    loader    = make_dataloader(X_local, y_local, BATCH_SIZE)
+    criterion = make_focal_loss(y_local)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=lr * 0.01)
+
+    epoch_losses = []
+    for ep in range(epochs):
+        total_loss, n_batches = 0.0, 0
+        for X_batch, y_batch in loader:
+            X_batch = X_batch.to(DEVICE)
+            y_batch = y_batch.to(DEVICE)
+            optimizer.zero_grad()
+            logits = model(X_batch)
+            loss   = criterion(logits, y_batch)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            total_loss += loss.item()
+            n_batches  += 1
+        scheduler.step()
+        epoch_losses.append(total_loss / max(n_batches, 1))
+
+    return model, epoch_losses
+
+
+@torch.no_grad()
+def evaluate_global(model: nn.Module, X_t: torch.Tensor,
+                    y_t: torch.Tensor) -> tuple:
+    """
+    Evaluate global model on the held-out test set.
+    Returns (accuracy, predicted labels numpy array).
+    """
+    model.eval()
+    logits = model(X_t)
+    preds  = logits.argmax(dim=1).cpu().numpy()
+    labels = y_t.cpu().numpy()
+    acc    = accuracy_score(labels, preds)
+    return acc, preds
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# MODULE 6 — FEDERATED LEARNING ROUNDS
+# ════════════════════════════════════════════════════════════════════════════
+
+print("\n" + "="*72)
+print(f"  STEP 3 │ FEDERATED TRAINING  ({FL_ROUNDS} rounds × {LOCAL_EPOCHS} local epochs)")
+print("="*72)
+print(f"""
+  FL Protocol per Round:
+  ─────────────────────
+  1. Server broadcasts global model weights to all clients
+  2. Each client:
+       a. Loads global weights into its local model
+       b. Trains for {LOCAL_EPOCHS} epochs using local data
+          (Focal Loss + AdamW + CosineAnnealingLR + WeightedSampler)
+       c. Sends updated weight tensors back to server
+  3. Server aggregates: W_global = Σ (n_k / N) × W_k   [True FedAvg]
+  4. Evaluate global model on held-out test set
+  5. Repeat for {FL_ROUNDS} rounds
+""")
+
+# ── Initialise global model ───────────────────────────────────────────────
+global_model   = get_model()
+global_weights = get_model_weights(global_model)
+
+# ── Prepare local datasets ────────────────────────────────────────────────
+client_data = []
+for k in range(n_clients):
+    idx      = np.array(client_indices[k])
+    X_local  = X_train[idx]
+    y_local  = y_train[idx]
+    client_data.append((X_local, y_local))
+
+# ── Tracking ──────────────────────────────────────────────────────────────
+round_global_accs     = []
+round_client_accs     = defaultdict(list)
+all_client_losses     = defaultdict(list)   # k -> list of per-round epoch losses
+
+# ── FL Rounds ─────────────────────────────────────────────────────────────
+for fl_round in range(1, FL_ROUNDS + 1):
+    print(f"\n  {'─'*65}")
+    print(f"  ▶  ROUND {fl_round}/{FL_ROUNDS}")
+    print(f"  {'─'*65}")
+
+    participating_weights = []
+    participating_sizes   = []
+
+    for k in range(n_clients):
+        X_local, y_local = client_data[k]
+        n_local          = len(X_local)
+
+        # Step 1: Load global weights into local model
+        local_model = get_model()
+        set_model_weights(local_model, copy.deepcopy(global_weights))
+
+        # Step 2: Local training
+        local_model, ep_losses = local_train(
+            local_model, X_local, y_local,
+            epochs=LOCAL_EPOCHS, lr=LR, wd=WEIGHT_DECAY)
+
+        # Step 3: Local evaluation
+        local_model.eval()
+        with torch.no_grad():
+            X_lt = torch.from_numpy(X_local).float().to(DEVICE)
+            y_lt = torch.from_numpy(y_local).long().to(DEVICE)
+            local_preds = local_model(X_lt).argmax(1).cpu().numpy()
+        local_acc = accuracy_score(y_local, local_preds)
+        round_client_accs[k].append(local_acc)
+        all_client_losses[k].extend(ep_losses)
+
+        dom_pct = 100 * Counter(y_local)[k] / len(y_local)
+        print(f"    [{k}] {client_names[k]:<40} "
+              f"n={n_local:>7,}  dom={dom_pct:.0f}%  "
+              f"loss={ep_losses[-1]:.4f}  local_acc={local_acc:.4f}")
+
+        # Step 4: Collect weights for aggregation
+        participating_weights.append(get_model_weights(local_model))
+        participating_sizes.append(n_local)
+
+    # Step 5: FedAvg aggregation
+    global_weights = fedavg_aggregate(participating_weights, participating_sizes)
+    set_model_weights(global_model, global_weights)
+
+    # Step 6: Global evaluation
+    round_acc, _ = evaluate_global(global_model, X_test_t, y_test_t)
+    round_global_accs.append(round_acc)
+    print(f"\n  🌐 Round {fl_round} Global Accuracy : {round_acc*100:.2f}%")
+
+print(f"\n  {'='*65}")
+print(f"  FL Training Complete ✓")
+print(f"  Best Round Accuracy  : {max(round_global_accs)*100:.2f}%  "
+      f"(Round {np.argmax(round_global_accs)+1})")
+print(f"  Final Round Accuracy : {round_global_accs[-1]*100:.2f}%")
+print(f"  {'='*65}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# MODULE 7 — FINAL EVALUATION & REPORTING
+# ════════════════════════════════════════════════════════════════════════════
+
+print("\n" + "="*72)
+print("  STEP 4 │ FINAL GLOBAL MODEL EVALUATION")
+print("="*72)
+
+final_acc, y_pred = evaluate_global(global_model, X_test_t, y_test_t)
+print(f"\n  ✅ Final Global Federated Accuracy : {final_acc*100:.2f}%\n")
 print(classification_report(y_test, y_pred, target_names=classes,
                              digits=4, zero_division=0))
 
-print(f"\n  Per-Client Summary:")
-print(f"  {'#':<4} {'Class':<22} {'Samples':>9} {'Dom%':>7} {'LocalAcc':>10}")
-print(f"  {'-'*58}")
+print(f"\n  Per-Client Summary (final round):")
+print(f"  {'#':<4} {'Class':<24} {'Samples':>8} {'Dom%':>6} {'FinalLocalAcc':>14}")
+print(f"  {'-'*62}")
 for k in range(n_clients):
-    dom_pct = 100 * Counter(y_train[client_indices[k]]).get(k,0) / len(client_indices[k])
-    acc_str = f"{local_accs[k]:.4f}" if local_accs[k] is not None else "skipped"
-    flag = "✅" if dom_pct >= 50 else "⚠️ "
-    print(f"  {flag}{k:<3} {classes[k]:<22} {len(client_indices[k]):>9,} "
-          f"{dom_pct:>6.1f}% {acc_str:>10}")
+    dom_pct   = 100 * Counter(y_train[client_indices[k]]).get(k, 0) / len(client_indices[k])
+    final_loc = round_client_accs[k][-1] if round_client_accs[k] else 0
+    flag      = "✅" if dom_pct >= 50 else "⚠️ "
+    print(f"  {flag}{k:<3} {classes[k]:<24} {len(client_indices[k]):>8,} "
+          f"{dom_pct:>5.1f}% {final_loc:>14.4f}")
 
-print(f"\n  {'─'*58}")
-print(f"  Global Federated Accuracy : {global_acc*100:.2f}%")
-print(f"  {'─'*58}\n")
+print(f"\n  {'─'*62}")
+print(f"  Final Global Federated Accuracy : {final_acc*100:.2f}%")
+print(f"  {'─'*62}")
 
-# ── Plots ─────────────────────────────────────────────────────────────────
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-fig.suptitle(f"v3 Federated Results  |  Global Accuracy = {global_acc*100:.2f}%",
-             fontsize=12, fontweight="bold")
 
-cm = confusion_matrix(y_test, y_pred)
-ConfusionMatrixDisplay(cm, display_labels=classes).plot(
-    ax=axes[0], colorbar=False, xticks_rotation=45, cmap="Blues")
-axes[0].set_title("Global Model — Confusion Matrix")
+# ════════════════════════════════════════════════════════════════════════════
+# MODULE 8 — VISUALISATIONS
+# ════════════════════════════════════════════════════════════════════════════
 
-valid_k  = [k for k in range(n_clients) if local_accs[k] is not None]
-clabels  = [f"C{k}\n{classes[k][:7]}" for k in valid_k]
-cvals    = [local_accs[k] for k in valid_k]
-dom_pcts = [100*Counter(y_train[client_indices[k]]).get(k,0)/len(client_indices[k])
-            for k in valid_k]
+print("\n  Generating visualisations...")
 
-bars = axes[1].bar(clabels, cvals, color="steelblue", edgecolor="white")
-axes[1].axhline(global_acc, color="crimson", linestyle="--", linewidth=2,
-                label=f"Global FedAcc={global_acc*100:.2f}%")
-axes[1].set_ylim(0, 1.12)
-axes[1].set_title("Per-Client Accuracy (dom% shown above bar)")
-axes[1].set_ylabel("Accuracy")
-axes[1].legend(fontsize=9)
-for bar, val, dp in zip(bars, cvals, dom_pcts):
-    axes[1].text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.01,
-                 f"{val:.3f}\ndom:{dp:.0f}%", ha="center", va="bottom", fontsize=8)
+colors6 = plt.cm.tab10(np.linspace(0, 1, n_clients))
 
+# ── Fig 1: FL Round Accuracy Progression ──────────────────────────────────
+fig, ax = plt.subplots(figsize=(10, 5))
+ax.plot(range(1, FL_ROUNDS+1), [a*100 for a in round_global_accs],
+        "o-", color="crimson", linewidth=2.5, markersize=8,
+        label="Global Model Accuracy")
+for r, acc in enumerate(round_global_accs, 1):
+    ax.annotate(f"{acc*100:.2f}%", (r, acc*100),
+                textcoords="offset points", xytext=(0, 10),
+                ha="center", fontsize=9, color="crimson")
+
+# Per-client accuracy across rounds
+for k in range(n_clients):
+    ax.plot(range(1, FL_ROUNDS+1),
+            [a*100 for a in round_client_accs[k]],
+            "--", alpha=0.5, color=colors6[k],
+            label=f"C{k}:{classes[k][:10]}")
+
+ax.set_xlabel("FL Round")
+ax.set_ylabel("Accuracy (%)")
+ax.set_title(f"Federated Learning — Accuracy per Round\n"
+             f"(Neural Network + FedAvg, {FL_ROUNDS} Rounds × {LOCAL_EPOCHS} Local Epochs)",
+             fontsize=11)
+ax.set_xticks(range(1, FL_ROUNDS+1))
+ax.legend(fontsize=8, loc="lower right")
+ax.grid(alpha=0.3)
 plt.tight_layout()
-plt.savefig(os.path.join(OUTPUT_DIR, "results_v3.png"), dpi=150)
+plt.savefig(f"{OUTPUT_DIR}/fl_nn_round_accuracy.png", dpi=150)
 plt.close()
 
-print("  Plots saved ✓")
-print("  Pipeline v3 complete ✓\n")
+# ── Fig 2: Local Training Loss per Client ─────────────────────────────────
+fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+axes = axes.flatten()
+for k in range(n_clients):
+    losses = all_client_losses[k]
+    axes[k].plot(losses, color=colors6[k], linewidth=1.5)
+    axes[k].set_title(f"C{k}: {classes[k]}", fontsize=10)
+    axes[k].set_xlabel("Epoch (across all rounds)")
+    axes[k].set_ylabel("Focal Loss")
+    axes[k].grid(alpha=0.3)
+    # Mark round boundaries
+    for r in range(1, FL_ROUNDS):
+        axes[k].axvline(r * LOCAL_EPOCHS - 0.5, color="gray",
+                        linestyle=":", alpha=0.6)
+fig.suptitle("Local Client Training Loss  (vertical lines = FL round boundaries)",
+             fontsize=12, fontweight="bold")
+plt.tight_layout()
+plt.savefig(f"{OUTPUT_DIR}/fl_nn_client_losses.png", dpi=150)
+plt.close()
+
+# ── Fig 3: Confusion Matrix ────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(9, 7))
+cm = confusion_matrix(y_test, y_pred)
+ConfusionMatrixDisplay(cm, display_labels=classes).plot(
+    ax=ax, colorbar=True, xticks_rotation=45, cmap="Blues")
+ax.set_title(f"Global Federated NN — Confusion Matrix\n"
+             f"(Accuracy = {final_acc*100:.2f}%)", fontsize=11)
+plt.tight_layout()
+plt.savefig(f"{OUTPUT_DIR}/fl_nn_confusion_matrix.png", dpi=150)
+plt.close()
+
+# ── Fig 4: Final Per-Client vs Global Accuracy ────────────────────────────
+fig, ax = plt.subplots(figsize=(11, 5))
+final_local = [round_client_accs[k][-1] for k in range(n_clients)]
+dom_pcts_all = [100*Counter(y_train[client_indices[k]]).get(k,0)/len(client_indices[k])
+                for k in range(n_clients)]
+bars = ax.bar(
+    [f"C{k}\n{classes[k][:9]}" for k in range(n_clients)],
+    final_local, color=colors6, edgecolor="white")
+ax.axhline(final_acc, color="crimson", linestyle="--", linewidth=2.2,
+           label=f"Global FedAvg Acc = {final_acc*100:.2f}%")
+ax.set_ylim(0, 1.12)
+ax.set_title("Final Local Accuracy per Client vs Global Federated Accuracy",
+             fontsize=11)
+ax.set_ylabel("Accuracy")
+ax.legend(fontsize=10)
+for bar, val, dp in zip(bars, final_local, dom_pcts_all):
+    ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.01,
+            f"{val:.3f}\ndom:{dp:.0f}%", ha="center", va="bottom", fontsize=8)
+plt.tight_layout()
+plt.savefig(f"{OUTPUT_DIR}/fl_nn_client_accuracy.png", dpi=150)
+plt.close()
+
+# ── Fig 5: FedAvg Weight Aggregation Diagram ──────────────────────────────
+fig, ax = plt.subplots(figsize=(10, 4))
+ax.axis("off")
+total = sum(len(client_indices[k]) for k in range(n_clients))
+fed_w = [len(client_indices[k]) / total for k in range(n_clients)]
+table_data = [["Client", "Dominant Class", "Samples", "FedAvg Weight", "Final Local Acc"]]
+for k in range(n_clients):
+    table_data.append([
+        f"C{k}", classes[k],
+        f"{len(client_indices[k]):,}",
+        f"{fed_w[k]:.4f}",
+        f"{round_client_accs[k][-1]:.4f}"
+    ])
+table_data.append(["─"*6, "─"*20, "─"*10, "─"*14, "─"*16])
+table_data.append(["GLOBAL", "FedAvg Aggregated", f"{total:,}", "1.0000",
+                   f"{final_acc:.4f}"])
+
+t = ax.table(cellText=table_data[1:], colLabels=table_data[0],
+             loc="center", cellLoc="center")
+t.auto_set_font_size(False)
+t.set_fontsize(10)
+t.scale(1.2, 2.0)
+for j in range(len(table_data[0])):
+    t[0, j].set_facecolor("#2c3e50")
+    t[0, j].set_text_props(color="white", fontweight="bold")
+for j in range(len(table_data[0])):
+    t[len(table_data)-1, j].set_facecolor("#27ae60")
+    t[len(table_data)-1, j].set_text_props(color="white", fontweight="bold")
+for i in range(1, n_clients+1):
+    for j in range(len(table_data[0])):
+        t[i, j].set_facecolor((*colors6[i-1][:3], 0.15))
+
+ax.set_title("FedAvg Weight Summary  —  W_global = Σ (n_k / N) × W_k",
+             fontsize=12, fontweight="bold", pad=20)
+plt.tight_layout()
+plt.savefig(f"{OUTPUT_DIR}/fl_nn_fedavg_summary.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+print("  All 5 plots saved ✓")
+print(f"\n{'='*72}")
+print(f"  PIPELINE COMPLETE")
+print(f"  ✅ Final Global Federated Accuracy : {final_acc*100:.2f}%")
+print(f"  Output files saved to : {OUTPUT_DIR}")
+print(f"{'='*72}\n")
