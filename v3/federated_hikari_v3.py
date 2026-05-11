@@ -3,7 +3,7 @@
   FEDERATED LEARNING — NEURAL NETWORK + TRUE FedAvg WEIGHT AGGREGATION
   Dataset : ALLFLOWMETER_HIKARI_2021
   Author  : FL Engineer
-  Version : v4 — Neural Network Edition
+  Version : v3 — Neural Network Edition(batchNorm + Dropout + GELU + Focal Loss + AdamW + CosineLR)
 =============================================================================
 
   ARCHITECTURE OVERVIEW
